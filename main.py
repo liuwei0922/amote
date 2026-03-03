@@ -1,103 +1,85 @@
-import random
-from src.processor.input.vec import TextInputProcessor
-from src.processor.input.state import StateInputProcessor
-from src.processor.core import DynamicalCoreProcessor
-from src.processor.output.match import MatchOutputProcessor
 import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+from src.system import System
 
-WORLD_RULES = {"向左": "WEST", "向右": "EAST", "向前": "NORTH", "向后": "SOUTH"}
+
+WORLD_RULES = {"左": "WEST", "右": "EAST", "前": "NORTH", "后": "SOUTH"}
+ALL_INSTRUCTIONS = list(WORLD_RULES.keys())
+ALL_STATES = ["NORTH", "SOUTH", "EAST", "WEST"]
 
 
 def main():
-    print("=== AGI Pipeline: 动力学核心 + 路由分发测试 ===")
+    print("=== AGI System: 端到端动态算子网络训练 ===")
 
-    CORE_DIM = 128
-
-    p_text = TextInputProcessor(core_dim=CORE_DIM)
-    p_state = StateInputProcessor(core_dim=CORE_DIM)
-
-    p_core = DynamicalCoreProcessor(core_dim=CORE_DIM)
-
-    p_out = MatchOutputProcessor(core_dim=CORE_DIM)
-
-    p_core.register_output(p_out)  # 路由 ID 为 0
-
-    trainable_processors = [p_text, p_state]
+    model = System()
+    optimizer = optim.Adam(model.parameters(), lr=0.002)
+    loss_fn = nn.CrossEntropyLoss()
 
     epochs = 6000
     for epoch in range(epochs):
-        p_text.output_buffer.clear()
-        p_state.output_buffer.clear()
-        p_core.output_buffer.clear()
-        p_out.output_buffer.clear()
-
         if random.random() < 0.5:
-            inst = random.choice(list(WORLD_RULES.keys()))
+            inst = random.choice(ALL_INSTRUCTIONS)
             state = WORLD_RULES[inst]
-            is_correct = True
+            is_match = True
         else:
-            inst = random.choice(list(WORLD_RULES.keys()))
-            wrong_states = ["NORTH", "SOUTH", "EAST", "WEST"]
-            wrong_states.remove(WORLD_RULES[inst])
-            state = random.choice(wrong_states)
-            is_correct = False
+            inst = random.choice(ALL_INSTRUCTIONS)
+            state = random.choice(ALL_STATES)
+            while state == WORLD_RULES[inst]:
+                state = random.choice(ALL_STATES)
+            is_match = False
 
-        p_text.process(inst)
-        p_state.process(state)
+        inputs = [[inst], [state]]
 
-        signals_in = p_text.fetch_signals() + p_state.fetch_signals()
-        p_core.process(signals_in)
+        optimizer.zero_grad()
 
-        loss_out = None
-        if p_out.output_buffer:
-            guess_res = p_out.fetch_signals()[0]
-            loss_out = p_out.learn(is_correct)
-        else:
-            guess_res = "NO_ROUTE"
+        results, route_logits = model(inputs)
+
+        logits = results[0]
+
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+
+        target_label = 0 if is_match else 1
+        target = torch.tensor([target_label], dtype=torch.long)
+
+        loss = loss_fn(logits, target)
+
+        loss.backward()
+        optimizer.step()
+
+
+        if (epoch + 1) % 200 == 0:
+            pred_idx = torch.argmax(logits, dim=-1).item()
             
-        loss_route = p_core.learn(target_route_idx=0)
-        
-        total_loss = torch.tensor(0.0, requires_grad=True)
-        if loss_out is not None: total_loss = total_loss + loss_out
-        if loss_route is not None: total_loss = total_loss + loss_route
-        
-        p_text.optimizer.zero_grad()
-        p_state.optimizer.zero_grad()
-        p_core.optimizer.zero_grad()
-        p_out.optimizer.zero_grad()
-        
-        total_loss.backward()
-        
-        p_text.optimizer.step()
-        p_state.optimizer.step()
-        p_core.optimizer.step()
-        p_out.optimizer.step()
+            pred_str = "MATCH" if pred_idx == 0 else "MISMATCH"
+            truth_str = "MATCH" if is_match else "MISMATCH"
+            
+            print(f"Epoch {epoch+1:4d} | 听:[{inst}] 摸:[{state}] -> 猜:{pred_str} | 真:{truth_str} | Loss:{loss.item():.4f}")
 
-
-        if (epoch + 1) % 400 == 0:
-            print(
-                f"Epoch {epoch+1:4d} | 听:[{inst}] 摸:[{state}] -> 猜:{guess_res} | 真:{'MATCH' if is_correct else 'MISMATCH'}"
-            )
-
-    # 测试泛化
-    print("\n=== 测试泛化涌现 ===")
+    # --- 泛化测试 ---
+    print("\n=== 泛化测试 (Zero-Shot) ===")
     test_cases = [
-        ("左边", "WEST"),
-        ("右", "NORTH"),
-        ("前进", "NORTH"),
-        ("后退", "SOUTH"),
-        ("向左", "WEST"),
-        ("向右", "EAST"),
+        ("左", "WEST", True),
+        ("右", "NORTH", False),
+        ("前", "NORTH", True),
+        ("后", "SOUTH", True),
+        ("向左", "WEST", True),
+        ("向右", "EAST", True),
     ]
-    for t, s in test_cases:
-        p_text.process(t)
-        p_state.process(s)
-        p_core.process(p_text.fetch_signals() + p_state.fetch_signals())
-        if p_out.output_buffer:
-            ans = p_out.fetch_signals()[0]
-        else:
-            ans = "NO_ROUTE"
-        print(f"指令:'{t}', 状态:'{s}' => AI判断: {ans}")
+
+    model.eval()  # 切换到评估模式
+    with torch.no_grad():
+        for t, s, truth in test_cases:
+            inputs = [[t], [s]]
+            results, route_logits = model(inputs)
+            logits = results[0] # Tensor
+            pred_idx = torch.argmax(logits, dim=-1).item()
+            ans = "MATCH" if pred_idx == 0 else "MISMATCH"
+            print(
+                f"指令:'{t}', 状态:'{s}' => AI判断: {ans} (预期: {'MATCH' if truth else 'MISMATCH'})"
+            )
 
 
 if __name__ == "__main__":
