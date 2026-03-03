@@ -9,8 +9,6 @@ from .processor.core import CoreProcessor
 class Router(nn.Module):
     def __init__(self, core_dim, seq_len, num_outputs):
         super().__init__()
-        # Router 需要处理整个序列 [S, D]
-        # 简单粗暴且强大的方式：全连接层吃掉整个序列
         input_size = seq_len * core_dim
 
         self.selector = nn.Sequential(
@@ -20,16 +18,13 @@ class Router(nn.Module):
             nn.Linear(64, num_outputs),
         )
 
-        # 参数生成器：同样基于整个序列生成参数
         self.arg_generator = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(input_size, core_dim),  # 生成一个标准的 Argument Vector
+            nn.Linear(input_size, core_dim),
             nn.LayerNorm(core_dim),
         )
 
     def forward(self, internal_thoughts):
-        # internal_thoughts: [B, S, D]
-
         selection_logits = self.selector(internal_thoughts)  # [B, N]
         output_arg = self.arg_generator(internal_thoughts)  # [B, D]
 
@@ -41,7 +36,6 @@ class System(nn.Module):
         super().__init__()
         self.dim = 128
 
-        # 实例化子模块
         self.inputs = nn.ModuleList(
             [
                 TextInputProcessor(core_dim=self.dim),
@@ -87,3 +81,6 @@ class System(nn.Module):
             results[chosen_idx] = res
 
             return results, route_logits
+
+    def consolidate_memory(self, correct_mask):
+        self.core.update_memory(correct_mask)

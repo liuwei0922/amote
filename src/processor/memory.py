@@ -1,50 +1,59 @@
+import torch
 import numpy as np
-import pickle
-from typing import List, Optional
-from src.core.signal import InternalSignal
-from src.processor.base import Processor
 
 
-class MemoryProcessor(Processor):
-    def __init__(self, db_path: str = "brain_memory.pkl"):
-        super().__init__()
-        self.db_path = db_path
-        self.memory_store: dict[str, np.ndarray] = self._load_db()
+class GraphMemory:
+    def __init__(self, dim=128):
+        self.nodes = []
 
-    def _load_db(self):
-        try:
-            with open(self.db_path, "rb") as f:
-                return pickle.load(f)
-        except FileNotFoundError:
-            return {}
+        self.adj = {}
 
-    def save_db(self):
-        with open(self.db_path, "wb") as f:
-            pickle.dump(self.memory_store, f)
+        self.dim = dim
 
-    def process(self, action: str, signal: InternalSignal) -> None:
-        if action == "store":
-            self.memory_store[signal.debug_info] = signal.vector
-            print(f"  [Memory] 已巩固记忆: {signal.debug_info}")
-            self.save_db()
+    def _get_node_index(self, tensor):
+        if not self.nodes:
+            return -1
 
-        elif action == "query":
-            best_match_info = None
-            highest_sim = -1.0
+        stack = torch.stack(self.nodes)
+        dists = torch.norm(stack - tensor, dim=1)
+        min_dist, idx = torch.min(dists, dim=0)
 
-            for info, mem_vec in self.memory_store.items():
-                sim = np.dot(signal.vector, mem_vec)
-                if sim > highest_sim:
-                    highest_sim = sim
-                    best_match_info = info
+        if min_dist < 0.1:
+            return idx.item()
+        return -1
 
-            if highest_sim > 0.85 and best_match_info is not None:
-                print(
-                    f"  [Memory] 联想唤醒: 找到相似记忆 -> {best_match_info} (相似度 {highest_sim:.2f})"
-                )
-                recalled_signal = InternalSignal(
-                    self.memory_store[best_match_info], best_match_info
-                )
-                self.output_buffer.append(recalled_signal)
-            else:
-                print(f"  [Memory] 检索失败，没有相关记忆。")
+    def register(self, tensor):
+        idx = self._get_node_index(tensor)
+        if idx != -1:
+            return idx
+
+        self.nodes.append(tensor.detach().clone())
+        idx = len(self.nodes) - 1
+        self.adj[idx] = {}
+        return idx
+
+    def link(self, input_tensor, output_tensor, weight=1.0):
+        src = self.register(input_tensor)
+        dst = self.register(output_tensor)
+
+        current_w = self.adj[src].get(dst, 0.0)
+        self.adj[src][dst] = current_w + weight
+
+    def query(self, input_tensor, top_k=5):
+        src = self._get_node_index(input_tensor)
+        if src == -1:
+            return [], []
+
+        candidates = []
+        if src in self.adj:
+            for dst, w in self.adj[src].items():
+                candidates.append((w, self.nodes[dst]))
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+
+        top_candidates = candidates[:top_k]
+
+        recalled_tensors = [item[1] for item in top_candidates]
+        recall_weights = [item[0] for item in top_candidates]
+
+        return recalled_tensors, recall_weights
