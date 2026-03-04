@@ -11,3 +11,8 @@ wheels/
 word/
 # Virtual environments
 .venv
+
+
+# Added by cargo
+
+/target

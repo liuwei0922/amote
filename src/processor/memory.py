@@ -4,28 +4,32 @@ import numpy as np
 
 class GraphMemory:
     def __init__(self, dim=128):
-        self.nodes = []
-
-        self.adj = {}
-
+        self.nodes = []  # List[Tensor]
+        self.adj = {}  # {src_idx: {dst_idx: weight}}
         self.dim = dim
 
-    def _get_node_index(self, tensor):
+    def _find_similar_nodes(self, tensor, similarity_threshold=0.9):
         if not self.nodes:
-            return -1
+            return []
 
         stack = torch.stack(self.nodes)
-        dists = torch.norm(stack - tensor, dim=1)
-        min_dist, idx = torch.min(dists, dim=0)
+        tensor_n = torch.nn.functional.normalize(tensor.unsqueeze(0), p=2, dim=1)
+        stack_n = torch.nn.functional.normalize(stack, p=2, dim=1)
 
-        if min_dist < 0.1:
-            return idx.item()
-        return -1
+        sims = torch.mm(tensor_n, stack_n.t()).squeeze(0)
+
+        indices = (sims > similarity_threshold).nonzero(as_tuple=True)[0]
+
+        results = []
+        for idx in indices:
+            results.append((idx.item(), sims[idx].item()))
+
+        return results
 
     def register(self, tensor):
-        idx = self._get_node_index(tensor)
-        if idx != -1:
-            return idx
+        matches = self._find_similar_nodes(tensor, similarity_threshold=0.99)
+        if matches:
+            return matches[0][0]
 
         self.nodes.append(tensor.detach().clone())
         idx = len(self.nodes) - 1
@@ -35,25 +39,26 @@ class GraphMemory:
     def link(self, input_tensor, output_tensor, weight=1.0):
         src = self.register(input_tensor)
         dst = self.register(output_tensor)
+        current = self.adj[src].get(dst, 0.0)
+        self.adj[src][dst] = current + weight
 
-        current_w = self.adj[src].get(dst, 0.0)
-        self.adj[src][dst] = current_w + weight
+    def query_with_indices(self, input_tensor, threshold=0.1):
+        similar_sources = self._find_similar_nodes(
+            input_tensor, similarity_threshold=0.9
+        )
+        if not similar_sources:
+            return [], [], []
+        candidates = {}
 
-    def query(self, input_tensor, top_k=5):
-        src = self._get_node_index(input_tensor)
-        if src == -1:
-            return [], []
+        for src_idx, sim_score in similar_sources:
+            if src_idx in self.adj:
+                for dst, w in self.adj[src_idx].items():
+                    effective_weight = w * sim_score
+                    if effective_weight > threshold:
+                        candidates[dst] = candidates.get(dst, 0.0) + effective_weight
 
-        candidates = []
-        if src in self.adj:
-            for dst, w in self.adj[src].items():
-                candidates.append((w, self.nodes[dst]))
+        idxs = list(candidates.keys())
+        tensors = [self.nodes[i] for i in idxs]
+        weights = list(candidates.values())
 
-        candidates.sort(key=lambda x: x[0], reverse=True)
-
-        top_candidates = candidates[:top_k]
-
-        recalled_tensors = [item[1] for item in top_candidates]
-        recall_weights = [item[0] for item in top_candidates]
-
-        return recalled_tensors, recall_weights
+        return idxs, tensors, weights

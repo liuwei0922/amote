@@ -11,7 +11,7 @@ ALL_STATES = ["NORTH", "SOUTH", "EAST", "WEST"]
 
 
 BATCH_SIZE = 32
-EPOCHS = 2000
+EPOCHS = 5000
 
 
 def main():
@@ -21,17 +21,11 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=0.002)
     loss_fn = nn.CrossEntropyLoss()
 
-    epochs = 20
-
     history_loss = []
     history_acc = []
-    recent_correct = []
 
-    global_step = 0
     for epoch in range(EPOCHS):
         optimizer.zero_grad()
-
-        batch_loss = 0
 
         batch_insts = []
         batch_states = []
@@ -65,7 +59,7 @@ def main():
         optimizer.step()
 
         preds = torch.argmax(logits, dim=-1)
-        correct_mask = (preds == targets)
+        correct_mask = preds == targets
         model.consolidate_memory(correct_mask)
         acc = (preds == targets).float().mean().item()
 
