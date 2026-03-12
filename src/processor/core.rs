@@ -1,184 +1,162 @@
-use anyhow::Result;
-use candle_core::{Device, IndexOp, Module, Tensor};
-use candle_nn::{LayerNorm, Linear, Sequential, VarBuilder, layer_norm, linear};
-use std::cell::RefCell;
-use std::collections::HashMap;
-
 use crate::processor::GraphMemory;
 
-pub struct CoreProcessor {
-    dim: usize,
-    memory: RefCell<GraphMemory>,
-    fusion_net: Sequential,
-    op_net: Linear,
-    last_io_pair: RefCell<Option<(Tensor, Tensor)>>,
+use burn::nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig};
+use burn::prelude::*;
+use burn::tensor::activation::relu;
+
+#[derive(Config, Debug)]
+pub struct CoreProcessorConfig {
+    pub core_dim: usize,
 }
 
-impl CoreProcessor {
-    pub fn new(vs: VarBuilder, core_dim: usize) -> Result<Self> {
-        let memory = GraphMemory::new(core_dim);
+#[derive(Module, Debug)]
+pub struct CoreProcessor<B: Backend> {
+    fusion_linear: Linear<B>,
+    fusion_norm: LayerNorm<B>,
+    op_net: Linear<B>,
+}
 
-        let fusion_net = candle_nn::seq()
-            .add(linear(core_dim, core_dim, vs.pp("fusion_net.0"))?)
-            .add(layer_norm(core_dim, 1e-5, vs.pp("fusion_net.1"))?)
-            .add_fn(|x| x.relu());
+impl CoreProcessorConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> CoreProcessor<B> {
+        CoreProcessor {
+            fusion_linear: LinearConfig::new(self.core_dim, self.core_dim).init(device),
+            fusion_norm: LayerNormConfig::new(self.core_dim).init(device),
+            op_net: LinearConfig::new(self.core_dim, self.core_dim).init(device),
+        }
+    }
+}
 
-        let op_net = linear(core_dim, core_dim, vs.pp("op_net"))?;
-
-        Ok(Self {
-            dim: core_dim,
-            memory: RefCell::new(memory),
-            fusion_net,
-            op_net,
-            last_io_pair: RefCell::new(None),
-        })
+impl<B: Backend> CoreProcessor<B> {
+    pub fn forward(&self, input_tensor: Tensor<B, 3>) -> Tensor<B, 3> {
+        let x = self.fusion_linear.forward(input_tensor);
+        let x = self.fusion_norm.forward(x);
+        let features = relu(x);
+        self.op_net.forward(features)
     }
 
-    pub fn forward(&self, input_tensor: &Tensor) -> Result<Tensor> {
-        let (batch_size, seq_len, _dim) = input_tensor.dims3()?;
-        let device = input_tensor.device();
+    pub fn apply_memory_correction(
+        &self,
+        input_tensor: Tensor<B, 3>,
+        raw_output: Tensor<B, 3>,
+        memory: &GraphMemory<B>,
+    ) -> Tensor<B, 3> {
+        let [batch_size, seq_len, _dim] = input_tensor.dims();
+        let device = &memory.device;
+        let core_dim = memory.dim;
 
-        let features = self.fusion_net.forward(input_tensor)?;
-        let raw_output = self.op_net.forward(&features)?;
-        let mut corrected_output_list = Vec::with_capacity(batch_size);
-
-        let memory = self.memory.borrow();
+        let mut corrected_batches = Vec::with_capacity(batch_size);
 
         for b in 0..batch_size {
-            struct CandidateData {
-                tensor: Tensor,
-                weights: Vec<f32>,
-            }
-            let mut candidates: HashMap<usize, CandidateData> = HashMap::new();
-
-            for s in 0..seq_len {
-                let token = input_tensor.i((b, s))?;
-
-                let (idxs, tensors, weights) = memory.query_with_indices(&token, 0.1)?;
-
-                for ((idx, tens), w) in idxs
-                    .into_iter()
-                    .zip(tensors.into_iter())
-                    .zip(weights.into_iter())
-                {
-                    let entry = candidates.entry(idx).or_insert_with(|| CandidateData {
-                        tensor: tens,
-                        weights: vec![0.0; seq_len],
-                    });
-                    entry.weights[s] = w;
-                }
-            }
-
             let mut final_seq = Vec::with_capacity(seq_len);
 
-            for s_out in 0..seq_len {
-                let target_vec = raw_output.i((b, s_out))?;
-                let mut correction = Tensor::zeros_like(&target_vec)?;
+            for s in 0..seq_len {
+                let token_in = input_tensor
+                    .clone()
+                    .slice([b..b + 1, s..s + 1, 0..core_dim])
+                    .reshape([core_dim]);
+
+                let target_vec = raw_output
+                    .clone()
+                    .slice([b..b + 1, s..s + 1, 0..core_dim])
+                    .reshape([core_dim]);
+
+                let (_, mem_tensors, weights) = memory.query_with_indices(&token_in, 0.1);
+
+                let mut correction = Tensor::<B, 1>::zeros([core_dim], device);
                 let mut total_influence = 0.0f32;
 
-                for data in candidates.values() {
-                    let w_list = &data.weights;
-                    let mem_vec = &data.tensor;
+                for (mem_vec, w) in mem_tensors.into_iter().zip(weights.into_iter()) {
+                    if w > 0.01 {
+                        let norm_sq = (mem_vec.clone() * mem_vec.clone()).sum();
+                        let norm_sq_val = norm_sq.clone().into_scalar().to_f32();
 
-                    let compound_weight: f32 = w_list.iter().sum();
+                        if norm_sq_val > 1e-6 {
+                            let dot = (target_vec.clone() * mem_vec.clone()).sum();
+                            let proj = mem_vec * (dot / norm_sq);
 
-                    if compound_weight > 0.01 {
-                        let norm_sq = (mem_vec * mem_vec)?.sum_all()?.to_scalar::<f32>()?;
-
-                        if norm_sq > 1e-6 {
-                            let dot = (target_vec.clone() * mem_vec)?
-                                .sum_all()?
-                                .to_scalar::<f32>()?;
-
-                            let scale = (dot / norm_sq) * compound_weight;
-                            let proj = (mem_vec * scale as f64)?;
-
-                            correction = (correction + proj)?;
-                            total_influence += compound_weight;
+                            correction = correction + (proj * w);
+                            total_influence += w;
                         }
                     }
                 }
 
                 let final_vec = if total_influence > 0.01 {
-                    let scale = 1.0 / (total_influence + 1e-5);
-                    let correction = (correction * scale as f64)?;
-                    (&target_vec + (correction * 0.5)?)?
+                    let correction_norm = correction / (total_influence + 1e-5);
+                    target_vec + (correction_norm * 0.5)
                 } else {
                     target_vec
                 };
 
-                final_seq.push(final_vec);
+                final_seq.push(final_vec.reshape([1, 1, core_dim]));
             }
 
-            corrected_output_list.push(Tensor::stack(&final_seq, 0)?);
+            let batch_tensor = Tensor::cat(final_seq, 1);
+            corrected_batches.push(batch_tensor);
         }
 
-        let final_output = Tensor::stack(&corrected_output_list, 0)?;
-
-        *self.last_io_pair.borrow_mut() = Some((input_tensor.detach(), final_output.detach()));
-
-        Ok(final_output)
-    }
-
-    pub fn update_memory(&self, mask: Option<&Tensor>) -> Result<()> {
-        let pair_ref = self.last_io_pair.borrow();
-        if let Some((inputs, outputs)) = pair_ref.as_ref() {
-            let (batch_size, seq_len, _) = inputs.dims3()?;
-
-            let mut mem = self.memory.borrow_mut();
-
-            for b in 0..batch_size {
-                let should_update = match mask {
-                    Some(m) => m.i(b)?.to_scalar::<u8>()? != 0,
-                    None => true,
-                };
-
-                if should_update {
-                    for s in 0..seq_len {
-                        let inp = inputs.i((b, s))?;
-                        let out = outputs.i((b, s))?;
-                        mem.link(&inp, &out, 1.0)?;
-                    }
-                }
-            }
-        }
-        Ok(())
+        Tensor::cat(corrected_batches, 0)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::DType;
+    use burn::backend::NdArray;
+
+    type TestBackend = NdArray<f32>;
 
     #[test]
-    fn test_core_processor_flow() -> Result<()> {
-        let device = Device::Cpu;
-        let varmap = candle_nn::VarMap::new();
-        let vs = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    fn test_core_processor_and_memory_integration() {
+        let device = Default::default();
+        let core_dim = 64;
+        let batch_size = 2;
+        let seq_len = 3;
 
-        let core_dim = 16;
-        let model = CoreProcessor::new(vs, core_dim)?;
+        let mut memory = GraphMemory::<TestBackend>::new(core_dim, &device);
+        let config = CoreProcessorConfig::new(core_dim);
+        let processor = config.init::<TestBackend>(&device);
 
-        let input = Tensor::randn(0f32, 1f32, (2, 5, core_dim), &device)?;
+        let input_tensor = Tensor::<TestBackend, 3>::random(
+            [batch_size, seq_len, core_dim],
+            burn::tensor::Distribution::Uniform(-1.0, 1.0),
+            &device,
+        );
 
-        let out1 = model.forward(&input)?;
-        assert_eq!(out1.dims(), &[2, 5, core_dim]);
-        println!("Forward 1 done.");
+        let raw_output = processor.forward(input_tensor.clone());
 
-        model.update_memory(None)?;
+        let final_output =
+            processor.apply_memory_correction(input_tensor.clone(), raw_output.clone(), &memory);
 
-        {
-            let mem = model.memory.borrow();
-            assert!(!mem.nodes.is_empty(), "Memory 应该记录了节点");
-            println!("Memory nodes count: {}", mem.nodes.len());
+        assert_eq!(raw_output.dims(), [batch_size, seq_len, core_dim]);
+        assert_eq!(final_output.dims(), [batch_size, seq_len, core_dim]);
+        assert_eq!(memory.nodes.len(), 0);
+
+        for b in 0..batch_size {
+            for s in 0..seq_len {
+                let inp_vec = input_tensor
+                    .clone()
+                    .slice([b..b + 1, s..s + 1, 0..core_dim])
+                    .reshape([core_dim]);
+
+                let out_vec = final_output
+                    .clone()
+                    .slice([b..b + 1, s..s + 1, 0..core_dim])
+                    .reshape([core_dim]);
+
+                memory.link(inp_vec, out_vec, 1.0);
+            }
         }
 
-        let noisy_input = (input + 0.01)?;
-        let out2 = model.forward(&noisy_input)?;
-        assert_eq!(out2.dims(), &[2, 5, core_dim]);
-        println!("Forward 2 done.");
+        assert!(memory.nodes.len() > 0);
+        assert!(memory.node_weights.len() > 0);
 
-        Ok(())
+        let raw_output_2 = processor.forward(input_tensor.clone());
+        let final_output_2 =
+            processor.apply_memory_correction(input_tensor.clone(), raw_output_2.clone(), &memory);
+
+        assert_eq!(final_output_2.dims(), [batch_size, seq_len, core_dim]);
+
+        println!("当前图记忆节点数量: {}", memory.nodes.len());
+        println!("第一个节点的熟悉度(权重): {}", memory.node_weights[0]);
     }
 }
