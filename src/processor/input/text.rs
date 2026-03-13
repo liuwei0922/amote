@@ -85,22 +85,63 @@ impl<B: Backend> TextInputProcessor<B> {
     }
 
     pub fn forward(&self, text: &[String]) -> Tensor<B, 3> {
-        let mut indices = Vec::with_capacity(text.len());
+        let batch_size = text.len();
+        let embed_dim = self.static_embeddings.dims()[1];
+        let mut batch_tensors = Vec::with_capacity(batch_size);
+
         for s in text {
-            let id = *self.vocab.get(s).unwrap_or(&self.unk_index);
-            indices.push(id as i32);
+            let mut char_indices = Vec::new();
+
+            if let Some(&id) = self.vocab.get(s) {
+                char_indices.push(id as i32);
+            } else {
+                for c in s.chars() {
+                    let char_str = c.to_string();
+                    if let Some(&id) = self.vocab.get(&char_str) {
+                        char_indices.push(id as i32);
+                    }
+                }
+            }
+
+            if char_indices.is_empty() {
+                char_indices.push(self.unk_index as i32);
+            }
+
+            let indices_tensor =
+                Tensor::<B, 1, Int>::from_ints(char_indices.as_slice(), &self.device);
+
+            let word_vecs = self.static_embeddings.clone().select(0, indices_tensor);
+
+            let sentence_vec = word_vecs.mean_dim(0);
+
+            batch_tensors.push(sentence_vec);
         }
 
-        let indices_tensor = Tensor::<B, 1, Int>::from_ints(indices.as_slice(), &self.device);
-
-        let x = self.static_embeddings.clone().select(0, indices_tensor);
+        let x = Tensor::cat(batch_tensors, 0);
 
         let x = self.model.translator.forward(x);
-
         let x = relu(x);
 
         x.unsqueeze_dim(1)
     }
+
+    // pub fn forward(&self, text: &[String]) -> Tensor<B, 3> {
+    //     let mut indices = Vec::with_capacity(text.len());
+    //     for s in text {
+    //         let id = *self.vocab.get(s).unwrap_or(&self.unk_index);
+    //         indices.push(id as i32);
+    //     }
+
+    //     let indices_tensor = Tensor::<B, 1, Int>::from_ints(indices.as_slice(), &self.device);
+
+    //     let x = self.static_embeddings.clone().select(0, indices_tensor);
+
+    //     let x = self.model.translator.forward(x);
+
+    //     let x = relu(x);
+
+    //     x.unsqueeze_dim(1)
+    // }
 
     #[allow(dead_code)]
     pub fn from_parts(
