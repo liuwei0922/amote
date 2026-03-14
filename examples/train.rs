@@ -52,39 +52,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rules = get_world_rules();
     let all_insts: Vec<&str> = rules.keys().cloned().collect();
 
-    // let mut vocab = HashMap::new();
-    // for (i, &w) in all_insts.iter().enumerate() {
-    //     vocab.insert(w.to_string(), i);
-    // }
-    // let unk_index = vocab.len();
+    let mut vocab = HashMap::new();
+    for (i, &w) in all_insts.iter().enumerate() {
+        vocab.insert(w.to_string(), i);
+    }
+    let unk_index = vocab.len();
 
-    // let static_embeddings = Tensor::<TrainBackend, 2>::random(
-    //     [unk_index + 1, EMBED_DIM],
-    //     burn::tensor::Distribution::Uniform(-1.0, 1.0),
-    //     &device,
-    // );
-
-    // let text_proc = TextInputProcessor::from_parts(
-    //     vocab,
-    //     static_embeddings,
-    //     unk_index,
-    //     TextTranslatorConfig::new(EMBED_DIM, CORE_DIM).init(&device),
-    //     device.clone(),
-    // );
-
-    // let state_proc = StateInputProcessorConfig::new(CORE_DIM).init(&device);
-    // let outputs = vec![MatchOutputProcessorConfig::new(CORE_DIM).init(&device)];
-    // let core = CoreProcessorConfig::new(CORE_DIM).init(&device);
-    // let router = RouterConfig::new(CORE_DIM, 2, outputs.len()).init(&device);
-    // let memory = GraphMemory::<TrainBackend>::new(CORE_DIM, &device);
-
-    // let mut system = System::from_parts(text_proc, state_proc, outputs, core, router, memory);
-
-    let mut system = System::<TrainBackend>::new(
-        "./word/tencent_vocab.json",
-        "./word/tencent_w2v.safetensors",
+    let static_embeddings = Tensor::<TrainBackend, 2>::random(
+        [unk_index + 1, EMBED_DIM],
+        burn::tensor::Distribution::Uniform(-1.0, 1.0),
         &device,
-    )?;
+    );
+
+    let text_proc = TextInputProcessor::from_parts(
+        vocab,
+        static_embeddings,
+        unk_index,
+        TextTranslatorConfig::new(EMBED_DIM, CORE_DIM).init(&device),
+        device.clone(),
+    );
+
+    let state_proc = StateInputProcessorConfig::new(CORE_DIM).init(&device);
+    let outputs = vec![MatchOutputProcessorConfig::new(CORE_DIM).init(&device)];
+    let core = CoreProcessorConfig::new(CORE_DIM).init(&device);
+    let router = RouterConfig::new(CORE_DIM, 2, outputs.len()).init(&device);
+    let memory = GraphMemory::<TrainBackend>::new(CORE_DIM, &device);
+
+    let mut system = System::from_parts(text_proc, state_proc, outputs, core, router, memory);
+
+    // let mut system = System::<TrainBackend>::new(
+    //     "./word/tencent_vocab.json",
+    //     "./word/tencent_w2v.safetensors",
+    //     &device,
+    // )?;
 
     let mut optim = AdamWConfig::new().with_weight_decay(0.0).init();
     let ce_loss = CrossEntropyLossConfig::new().init(&device);

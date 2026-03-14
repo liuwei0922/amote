@@ -63,10 +63,11 @@ impl<B: Backend> GraphMemory<B> {
         let matches = self.find_similar_nodes(&tensor, 0.95);
 
         if let Some((idx, _sim)) = matches.first() {
+            let old_weight = self.node_weights[*idx];
             let old_tensor = self.nodes[*idx].clone();
             let new_tensor = tensor.detach();
 
-            let updated_tensor = old_tensor * 0.5 + new_tensor * 0.5;
+            let updated_tensor = (old_tensor * old_weight + new_tensor) / (old_weight + 1.0);
 
             self.nodes[*idx] = updated_tensor;
 
